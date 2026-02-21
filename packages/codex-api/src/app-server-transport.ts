@@ -5,10 +5,21 @@ import {
   AppServerRpcError,
   AppServerTransportError
 } from "./errors.js";
-import { JsonRpcRequestSchema, parseJsonRpcIncomingMessage } from "./json-rpc.js";
+import {
+  JsonRpcRequestSchema,
+  parseJsonRpcIncomingMessage,
+  type JsonRpcNotification,
+  type JsonRpcServerRequest
+} from "./json-rpc.js";
+
+export type AppServerNotificationListener = (notification: JsonRpcNotification) => void;
+export type AppServerServerRequestListener = (request: JsonRpcServerRequest) => void;
 
 export interface AppServerTransport {
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
+  sendResponse(id: number, result?: unknown, error?: { code: number; message: string; data?: unknown }): void;
+  onNotification(listener: AppServerNotificationListener): () => void;
+  onServerRequest(listener: AppServerServerRequestListener): () => void;
   close(): Promise<void>;
 }
 
@@ -36,6 +47,8 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
   private readonly onStderr: ((line: string) => void) | undefined;
   private process: ChildProcessWithoutNullStreams | null = null;
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly notificationListeners = new Set<AppServerNotificationListener>();
+  private readonly serverRequestListeners = new Set<AppServerServerRequestListener>();
   private requestId = 0;
   private initialized = false;
   private initializeInFlight: Promise<void> | null = null;
@@ -47,6 +60,40 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     this.env = options.env;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.onStderr = options.onStderr;
+  }
+
+  public onNotification(listener: AppServerNotificationListener): () => void {
+    this.notificationListeners.add(listener);
+    return () => {
+      this.notificationListeners.delete(listener);
+    };
+  }
+
+  public onServerRequest(listener: AppServerServerRequestListener): () => void {
+    this.serverRequestListeners.add(listener);
+    return () => {
+      this.serverRequestListeners.delete(listener);
+    };
+  }
+
+  private emitNotification(notification: JsonRpcNotification): void {
+    for (const listener of this.notificationListeners) {
+      try {
+        listener(notification);
+      } catch {
+        // Never fail protocol handling because of listener errors.
+      }
+    }
+  }
+
+  private emitServerRequest(request: JsonRpcServerRequest): void {
+    for (const listener of this.serverRequestListeners) {
+      try {
+        listener(request);
+      } catch {
+        // Never fail protocol handling because of listener errors.
+      }
+    }
   }
 
   private ensureStarted(): void {
@@ -108,6 +155,12 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
       }
 
       if (message.kind === "notification") {
+        this.emitNotification(message.value);
+        return;
+      }
+
+      if (message.kind === "serverRequest") {
+        this.emitServerRequest(message.value);
         return;
       }
 
@@ -199,6 +252,50 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     });
   }
 
+  public sendResponse(
+    id: number,
+    result?: unknown,
+    error?: { code: number; message: string; data?: unknown }
+  ): void {
+    const processHandle = this.process;
+    if (!processHandle) {
+      return;
+    }
+
+    const response: Record<string, unknown> = {
+      jsonrpc: "2.0",
+      id
+    };
+
+    if (error) {
+      response["error"] = error;
+    } else {
+      response["result"] = result ?? null;
+    }
+
+    const encoded = JSON.stringify(response) + "\n";
+    processHandle.stdin.write(encoded);
+  }
+
+  private sendNotification(method: string, params?: unknown): void {
+    const processHandle = this.process;
+    if (!processHandle) {
+      return;
+    }
+
+    const notification: Record<string, unknown> = {
+      jsonrpc: "2.0",
+      method
+    };
+
+    if (params !== undefined) {
+      notification["params"] = params;
+    }
+
+    const encoded = JSON.stringify(notification) + "\n";
+    processHandle.stdin.write(encoded);
+  }
+
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) {
       return;
@@ -228,6 +325,9 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
       }
 
       this.initialized = true;
+
+      // Send the initialized notification to complete the handshake.
+      this.sendNotification("initialized");
     })().finally(() => {
       this.initializeInFlight = null;
     });
@@ -245,6 +345,7 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     const result = await this.sendRequest(method, params, timeoutMs);
     if (method === "initialize") {
       this.initialized = true;
+      this.sendNotification("initialized");
     }
     return result;
   }

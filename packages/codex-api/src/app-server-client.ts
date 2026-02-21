@@ -16,10 +16,13 @@ import {
 import { ProtocolValidationError } from "@farfield/protocol";
 import { z } from "zod";
 import {
-  AppServerTransport,
+  type AppServerTransport,
+  type AppServerNotificationListener,
+  type AppServerServerRequestListener,
   ChildProcessAppServerTransport,
   type ChildProcessAppServerTransportOptions
 } from "./app-server-transport.js";
+import type { JsonRpcServerRequest } from "./json-rpc.js";
 
 function parseWithSchema<T>(
   schema: z.ZodType<T, z.ZodTypeDef, unknown>,
@@ -56,6 +59,15 @@ export interface StartThreadOptions {
   ephemeral?: boolean;
 }
 
+export interface StartTurnOptions {
+  threadId: string;
+  input: Array<{ type: "text"; text: string }>;
+  cwd?: string;
+  model?: string;
+  effort?: string;
+  approvalPolicy?: string;
+}
+
 const AppServerResumeThreadRequestSchema = z
   .object({
     threadId: z.string().min(1),
@@ -73,6 +85,22 @@ export class AppServerClient {
     }
 
     this.transport = new ChildProcessAppServerTransport(transportOrOptions);
+  }
+
+  public onNotification(listener: AppServerNotificationListener): () => void {
+    return this.transport.onNotification(listener);
+  }
+
+  public onServerRequest(listener: AppServerServerRequestListener): () => void {
+    return this.transport.onServerRequest(listener);
+  }
+
+  public respondToServerRequest(
+    id: number,
+    result?: unknown,
+    error?: { code: number; message: string; data?: unknown }
+  ): void {
+    this.transport.sendResponse(id, result, error);
   }
 
   public async close(): Promise<void> {
@@ -160,6 +188,21 @@ export class AppServerClient {
     const request = AppServerStartThreadRequestSchema.parse(options);
     const result = await this.transport.request("thread/start", request);
     return parseWithSchema(AppServerStartThreadResponseSchema, result, "AppServerStartThreadResponse");
+  }
+
+  public async startTurn(options: StartTurnOptions): Promise<void> {
+    await this.transport.request("turn/start", {
+      threadId: options.threadId,
+      input: options.input,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
+      ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {})
+    });
+  }
+
+  public async interruptTurn(threadId: string): Promise<void> {
+    await this.transport.request("turn/interrupt", { threadId });
   }
 
   public async sendUserMessage(threadId: string, text: string): Promise<void> {

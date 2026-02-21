@@ -405,7 +405,8 @@ function getRuntimeStateSnapshot(): Record<string, unknown> {
     lastError: runtimeLastError ?? codexRuntimeState?.lastError ?? null,
     historyCount: history.length,
     threadOwnerCount: codexAdapter?.getThreadOwnerCount() ?? 0,
-    activeTrace: activeTrace?.summary ?? null
+    activeTrace: activeTrace?.summary ?? null,
+    pendingServerRequestCount: codexAdapter?.getPendingServerRequests().length ?? 0
   };
 }
 

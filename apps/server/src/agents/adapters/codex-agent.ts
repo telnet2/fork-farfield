@@ -11,6 +11,7 @@ import {
   ThreadStreamReductionError,
   type SendRequestOptions
 } from "@farfield/api";
+import type { JsonRpcNotification, JsonRpcServerRequest } from "@farfield/api";
 import {
   parseThreadStreamStateChangedBroadcast,
   parseUserInputResponsePayload,
@@ -66,6 +67,34 @@ const ANSI_ESCAPE_REGEX = /\u001B\[[0-?]*[ -/]*[@-~]/g;
 const INVALID_STREAM_EVENTS_LOG_PATH = process.env["FARFIELD_INVALID_STREAM_LOG_PATH"] ??
   path.resolve(process.cwd(), "invalid-thread-stream-events.jsonl");
 
+const APP_SERVER_NOTIFICATION_LIMIT = 400;
+
+function extractThreadIdFromNotificationParams(params: unknown): string | null {
+  if (!params || typeof params !== "object") {
+    return null;
+  }
+
+  const record = params as Record<string, unknown>;
+  const candidates = ["threadId", "conversationId", "thread_id"];
+  for (const key of candidates) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
+function notificationToSyntheticFrame(notification: JsonRpcNotification): IpcFrame {
+  return {
+    type: "broadcast",
+    method: notification.method,
+    params: notification.params,
+    sourceClientId: "app-server"
+  };
+}
+
 export class CodexAgentAdapter implements AgentAdapter {
   public readonly id = "codex";
   public readonly label = "Codex";
@@ -86,6 +115,8 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   private readonly threadOwnerById = new Map<string, string>();
   private readonly streamEventsByThreadId = new Map<string, IpcFrame[]>();
+  private readonly appServerNotificationsByThreadId = new Map<string, JsonRpcNotification[]>();
+  private readonly pendingServerRequests = new Map<number, JsonRpcServerRequest>();
   private readonly ipcFrameListeners = new Set<(event: CodexIpcFrameEvent) => void>();
 
   private runtimeState: CodexAgentRuntimeState = {
@@ -122,6 +153,16 @@ export class CodexAgentAdapter implements AgentAdapter {
       socketPath: options.socketPath
     });
     this.service = new CodexMonitorService(this.ipcClient);
+
+    // Listen for app-server notifications (streaming events).
+    this.appClient.onNotification((notification) => {
+      this.handleAppServerNotification(notification);
+    });
+
+    // Listen for server-to-client requests (approval prompts, user input).
+    this.appClient.onServerRequest((request) => {
+      this.handleAppServerRequest(request);
+    });
 
     this.ipcClient.onConnectionState((state) => {
       this.patchRuntimeState({
@@ -180,6 +221,66 @@ export class CodexAgentAdapter implements AgentAdapter {
     });
   }
 
+  private handleAppServerNotification(notification: JsonRpcNotification): void {
+    const threadId = extractThreadIdFromNotificationParams(notification.params);
+
+    // Emit as a synthetic IPC frame event for history/SSE.
+    const syntheticFrame = notificationToSyntheticFrame(notification);
+    this.emitIpcFrame({
+      direction: "in",
+      frame: syntheticFrame,
+      method: notification.method,
+      threadId
+    });
+
+    // Store per-thread for readStreamEvents.
+    if (threadId) {
+      const current = this.appServerNotificationsByThreadId.get(threadId) ?? [];
+      current.push(notification);
+      if (current.length > APP_SERVER_NOTIFICATION_LIMIT) {
+        current.splice(0, current.length - APP_SERVER_NOTIFICATION_LIMIT);
+      }
+      this.appServerNotificationsByThreadId.set(threadId, current);
+    }
+
+    // Trigger state change to notify SSE clients.
+    this.notifyStateChanged();
+  }
+
+  private handleAppServerRequest(request: JsonRpcServerRequest): void {
+    const threadId = extractThreadIdFromNotificationParams(request.params);
+
+    logger.info(
+      {
+        method: request.method,
+        requestId: request.id,
+        threadId
+      },
+      "codex-app-server-request"
+    );
+
+    // Emit as a synthetic IPC frame event for history.
+    const syntheticFrame: IpcFrame = {
+      type: "request",
+      requestId: String(request.id),
+      method: request.method,
+      params: request.params,
+      sourceClientId: "app-server"
+    };
+    this.emitIpcFrame({
+      direction: "in",
+      frame: syntheticFrame,
+      method: request.method,
+      threadId
+    });
+
+    // Store the pending request for frontend approval flow.
+    this.pendingServerRequests.set(request.id, request);
+
+    // Trigger state change to notify SSE clients of pending approval.
+    this.notifyStateChanged();
+  }
+
   public onIpcFrame(listener: (event: CodexIpcFrameEvent) => void): () => void {
     this.ipcFrameListeners.add(listener);
     return () => {
@@ -193,6 +294,34 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   public getThreadOwnerCount(): number {
     return this.threadOwnerById.size;
+  }
+
+  public getPendingServerRequests(): JsonRpcServerRequest[] {
+    return Array.from(this.pendingServerRequests.values());
+  }
+
+  public respondToServerRequest(
+    requestId: number,
+    result?: unknown,
+    error?: { code: number; message: string; data?: unknown }
+  ): void {
+    const pending = this.pendingServerRequests.get(requestId);
+    if (!pending) {
+      logger.warn({ requestId }, "codex-app-server-request-not-found");
+      return;
+    }
+
+    this.pendingServerRequests.delete(requestId);
+    this.appClient.respondToServerRequest(requestId, result, error);
+
+    logger.info(
+      {
+        method: pending.method,
+        requestId,
+        responded: error ? "error" : "success"
+      },
+      "codex-app-server-request-responded"
+    );
   }
 
   public isThreadNotLoadedError(error: Error): boolean {
@@ -337,6 +466,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       throw new Error("Steering messages are not supported on this endpoint.");
     }
 
+    // Path 1: IPC is available — use the desktop app's thread-follower protocol.
     if (this.isIpcReady()) {
       const mappedOwnerClientId = this.threadOwnerById.get(input.threadId);
       const overrideOwnerClientId = input.ownerClientId;
@@ -370,6 +500,28 @@ export class CodexAgentAdapter implements AgentAdapter {
       }
     }
 
+    // Path 2: Use app-server directly (works without IPC/Desktop App).
+    // Try turn/start first (modern API), fall back to sendUserMessage (v1 API).
+    try {
+      await this.runAppServerCall(() =>
+        this.appClient.startTurn({
+          threadId: input.threadId,
+          input: [{ type: "text", text: input.text }],
+          ...(input.cwd ? { cwd: input.cwd } : {})
+        })
+      );
+      return;
+    } catch (error) {
+      // If turn/start fails (e.g. thread not loaded), try the legacy path.
+      logger.debug(
+        {
+          threadId: input.threadId,
+          error: toErrorMessage(error)
+        },
+        "codex-turn-start-fallback"
+      );
+    }
+
     try {
       await this.runAppServerCall(() =>
         this.appClient.sendUserMessage(input.threadId, input.text)
@@ -391,18 +543,26 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   public async interrupt(input: AgentInterruptInput): Promise<void> {
     this.ensureCodexAvailable();
-    this.ensureIpcReady();
 
-    const ownerClientId = resolveOwnerClientId(
-      this.threadOwnerById,
-      input.threadId,
-      input.ownerClientId
+    // Path 1: IPC is available — use the desktop app's thread-follower protocol.
+    if (this.isIpcReady()) {
+      const ownerClientId = resolveOwnerClientId(
+        this.threadOwnerById,
+        input.threadId,
+        input.ownerClientId
+      );
+
+      await this.service.interrupt({
+        threadId: input.threadId,
+        ownerClientId
+      });
+      return;
+    }
+
+    // Path 2: Use app-server directly (works without IPC/Desktop App).
+    await this.runAppServerCall(() =>
+      this.appClient.interruptTurn(input.threadId)
     );
-
-    await this.service.interrupt({
-      threadId: input.threadId,
-      ownerClientId
-    });
   }
 
   public async listModels(limit: number) {
@@ -417,30 +577,49 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   public async setCollaborationMode(input: AgentSetCollaborationModeInput): Promise<{ ownerClientId: string }> {
     this.ensureCodexAvailable();
-    this.ensureIpcReady();
 
-    const ownerClientId = resolveOwnerClientId(
-      this.threadOwnerById,
-      input.threadId,
-      input.ownerClientId
-    );
+    if (this.isIpcReady()) {
+      const ownerClientId = resolveOwnerClientId(
+        this.threadOwnerById,
+        input.threadId,
+        input.ownerClientId
+      );
 
-    await this.service.setCollaborationMode({
-      threadId: input.threadId,
-      ownerClientId,
-      collaborationMode: input.collaborationMode
-    });
+      await this.service.setCollaborationMode({
+        threadId: input.threadId,
+        ownerClientId,
+        collaborationMode: input.collaborationMode
+      });
 
-    return {
-      ownerClientId
-    };
+      return {
+        ownerClientId
+      };
+    }
+
+    // Without IPC, collaboration mode setting is not supported.
+    throw new Error("Collaboration mode changes require the Codex Desktop App");
   }
 
   public async submitUserInput(
     input: AgentSubmitUserInputInput
   ): Promise<{ ownerClientId: string; requestId: number }> {
     this.ensureCodexAvailable();
-    this.ensureIpcReady();
+
+    // Check if this request is a pending app-server request (no IPC needed).
+    const pendingServerRequest = this.pendingServerRequests.get(input.requestId);
+    if (pendingServerRequest) {
+      const response = parseUserInputResponsePayload(input.response);
+      this.respondToServerRequest(input.requestId, response);
+      return {
+        ownerClientId: "app-server",
+        requestId: input.requestId
+      };
+    }
+
+    // Fall back to IPC path.
+    if (!this.isIpcReady()) {
+      throw new Error("No pending request found and Desktop IPC is not connected");
+    }
 
     const ownerClientId = resolveOwnerClientId(
       this.threadOwnerById,
@@ -462,15 +641,43 @@ export class CodexAgentAdapter implements AgentAdapter {
   }
 
   public async readLiveState(threadId: string): Promise<AgentThreadLiveState> {
+    // Path 1: IPC stream events available — use the existing reduction logic.
     const rawEvents = this.streamEventsByThreadId.get(threadId) ?? [];
-    if (rawEvents.length === 0) {
-      return {
-        ownerClientId: this.threadOwnerById.get(threadId) ?? null,
-        conversationState: null,
-        liveStateError: null
-      };
+    if (rawEvents.length > 0) {
+      return this.reduceLiveStateFromIpc(threadId, rawEvents);
     }
 
+    // Path 2: No IPC but app-server notifications exist — read thread from app-server.
+    const hasNotifications = (this.appServerNotificationsByThreadId.get(threadId) ?? []).length > 0;
+    if (hasNotifications && this.runtimeState.appReady) {
+      try {
+        const result = await this.runAppServerCall(() =>
+          this.appClient.readThread(threadId, true)
+        );
+        return {
+          ownerClientId: this.threadOwnerById.get(threadId) ?? "app-server",
+          conversationState: result.thread,
+          liveStateError: null
+        };
+      } catch (error) {
+        logger.debug(
+          {
+            threadId,
+            error: toErrorMessage(error)
+          },
+          "codex-live-state-app-server-fallback-failed"
+        );
+      }
+    }
+
+    return {
+      ownerClientId: this.threadOwnerById.get(threadId) ?? null,
+      conversationState: null,
+      liveStateError: null
+    };
+  }
+
+  private reduceLiveStateFromIpc(threadId: string, rawEvents: IpcFrame[]): AgentThreadLiveState {
     const events: ReturnType<typeof parseThreadStreamStateChangedBroadcast>[] = [];
     const validRawEvents: IpcFrame[] = [];
     let invalidEventCount = 0;
@@ -565,9 +772,17 @@ export class CodexAgentAdapter implements AgentAdapter {
   }
 
   public async readStreamEvents(threadId: string, limit: number): Promise<AgentThreadStreamEvents> {
+    // Merge IPC stream events and app-server notifications.
+    const ipcEvents = this.streamEventsByThreadId.get(threadId) ?? [];
+    const appNotifications = this.appServerNotificationsByThreadId.get(threadId) ?? [];
+    const syntheticFrames = appNotifications.map(notificationToSyntheticFrame);
+
+    // Combine and return the most recent events.
+    const combined = [...ipcEvents, ...syntheticFrames];
+
     return {
       ownerClientId: this.threadOwnerById.get(threadId) ?? null,
-      events: (this.streamEventsByThreadId.get(threadId) ?? []).slice(-limit)
+      events: combined.slice(-limit)
     };
   }
 
@@ -744,10 +959,18 @@ export class CodexAgentAdapter implements AgentAdapter {
           ipcInitialized: true
         });
       } catch (error) {
+        // IPC connection is optional — the adapter works without it using
+        // app-server notifications for real-time updates and app-server
+        // methods for turn control.
+        const errorMessage = toErrorMessage(error);
+        logger.info(
+          { error: errorMessage },
+          "codex-ipc-unavailable-using-app-server-only"
+        );
         this.patchRuntimeState({
           ipcInitialized: false,
           ipcConnected: this.ipcClient.isConnected(),
-          lastError: toErrorMessage(error)
+          lastError: null
         });
         this.scheduleIpcReconnect();
       } finally {

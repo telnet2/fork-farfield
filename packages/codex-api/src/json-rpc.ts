@@ -54,25 +54,69 @@ export const JsonRpcNotificationSchema = z
 
 export type JsonRpcNotification = z.infer<typeof JsonRpcNotificationSchema>;
 
+export const JsonRpcServerRequestSchema = z
+  .object({
+    jsonrpc: z.literal("2.0").optional(),
+    id: z.number().int().nonnegative(),
+    method: z.string().min(1),
+    params: z.unknown().optional()
+  })
+  .passthrough();
+
+export type JsonRpcServerRequest = z.infer<typeof JsonRpcServerRequestSchema>;
+
 export type JsonRpcIncomingMessage =
   | { kind: "response"; value: JsonRpcResponse }
-  | { kind: "notification"; value: JsonRpcNotification };
+  | { kind: "notification"; value: JsonRpcNotification }
+  | { kind: "serverRequest"; value: JsonRpcServerRequest };
 
 export function parseJsonRpcIncomingMessage(value: unknown): JsonRpcIncomingMessage {
+  if (!value || typeof value !== "object") {
+    throw ProtocolValidationError.fromZod(
+      "JsonRpcIncomingMessage",
+      new z.ZodError([{ code: z.ZodIssueCode.custom, message: "Expected object", path: [] }])
+    );
+  }
+
+  const record = value as Record<string, unknown>;
+  const hasId = typeof record["id"] === "number";
+  const hasMethod = typeof record["method"] === "string" && (record["method"] as string).length > 0;
+  const hasResult = record["result"] !== undefined;
+  const hasError = record["error"] !== undefined;
+
+  // Response: has id + result/error (no method)
+  if (hasId && (hasResult || hasError)) {
+    const parsed = JsonRpcResponseSchema.safeParse(value);
+    if (parsed.success) {
+      return { kind: "response", value: parsed.data };
+    }
+  }
+
+  // Server-to-client request: has id + method (approval prompts, etc.)
+  if (hasId && hasMethod) {
+    const parsed = JsonRpcServerRequestSchema.safeParse(value);
+    if (parsed.success) {
+      return { kind: "serverRequest", value: parsed.data };
+    }
+  }
+
+  // Notification: has method, no id (streaming events)
+  if (hasMethod && !hasId) {
+    const parsed = JsonRpcNotificationSchema.safeParse(value);
+    if (parsed.success) {
+      return { kind: "notification", value: parsed.data };
+    }
+  }
+
+  // Fallback: try all schemas in order
   const parsedResponse = JsonRpcResponseSchema.safeParse(value);
   if (parsedResponse.success) {
-    return {
-      kind: "response",
-      value: parsedResponse.data
-    };
+    return { kind: "response", value: parsedResponse.data };
   }
 
   const parsedNotification = JsonRpcNotificationSchema.safeParse(value);
   if (parsedNotification.success) {
-    return {
-      kind: "notification",
-      value: parsedNotification.data
-    };
+    return { kind: "notification", value: parsedNotification.data };
   }
 
   const combinedError = new z.ZodError([
